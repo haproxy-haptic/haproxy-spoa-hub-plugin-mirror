@@ -1,0 +1,12 @@
+plugin_dir = "/etc/haproxy-spoa-hub/plugins"
+default_timeout_ms = 500
+log_level = "debug"
+
+[[listeners]]
+type = "tcp"
+address = "0.0.0.0:12345"
+
+[[plugins]]
+name = "mirror"
+library = "libmirror_plugin.so"
+messages = ["mirror"]

@@ -1,0 +1,92 @@
+use std::sync::OnceLock;
+
+use haproxy_spoa_hub_plugin_api::{ProcessingResult, define_plugin};
+use tokio::runtime::Runtime;
+
+use crate::client::MirrorClient;
+use crate::config::PluginConfig;
+use crate::request::extract_mirror_request;
+
+/// Shared plugin state, initialised once in `init()` and read from every
+/// `process()` call. `OnceLock` matches the fingerprinting plugin's
+/// convention.
+struct PluginState {
+    config: PluginConfig,
+    runtime: Runtime,
+    client: MirrorClient,
+}
+
+static STATE: OnceLock<PluginState> = OnceLock::new();
+
+#[derive(Debug)]
+struct MirrorPlugin;
+
+define_plugin!(MirrorPlugin, {
+    fn new() -> Self {
+        MirrorPlugin
+    }
+
+    fn init(
+        &mut self,
+        context: &PluginContext,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let config = PluginConfig::from_context(context);
+
+        // Dedicated multi-thread runtime so reqwest's async stack runs
+        // off the SPOA worker. Two worker threads is enough for typical
+        // mirror workloads (the bottleneck is the upstream backend, not
+        // local CPU); scale via `request_concurrency` not threads.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("mirror-plugin")
+            .enable_all()
+            .build()?;
+
+        let client = MirrorClient::new(&config)?;
+
+        // OnceLock::set rejects on second-init; that's harmless here
+        // because the hub guarantees init() is called at most once per
+        // load. The .ok() drops the returning state on the rare double-
+        // init path (e.g. plugin reload), preventing a spurious leak.
+        let _ = STATE.set(PluginState {
+            config,
+            runtime,
+            client,
+        });
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "mirror"
+    }
+
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn process(
+        &self,
+        message: &SpoeMessage,
+    ) -> Result<ProcessingResult, Box<dyn std::error::Error + Send + Sync>> {
+        let state = STATE
+            .get()
+            .ok_or("mirror plugin: process() called before init()")?;
+
+        if let Some(req) = extract_mirror_request(message, state.config.max_body_bytes) {
+            let client = state.client.clone();
+            // Fire-and-forget: dispatch returns immediately on a saturated
+            // semaphore, otherwise sends the HTTP request and discards
+            // the response. The hub ACKs back to HAProxy without waiting.
+            state.runtime.spawn(async move {
+                client.dispatch(req).await;
+            });
+        }
+        // Mirror plugin never sets session variables — its effect is
+        // the dispatched request, not data flowing back to HAProxy.
+        Ok(ProcessingResult::empty())
+    }
+
+    fn config_schema(&self) -> Option<&str> {
+        Some(PluginConfig::config_schema())
+    }
+});

@@ -1,0 +1,39 @@
+[package]
+name = "mirror-plugin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+description = "HTTP request mirroring plugin for haproxy-spoa-hub (Gateway API HTTPRoute RequestMirror)"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Requires plugin-api 0.5.0+ (the hand-rolled #[repr(C)] vtable
+# migration). This plugin will not load on hubs older than v0.5.0.
+haproxy-spoa-hub-plugin-api = "0.5"
+# rustls-tls keeps the .so free of an OpenSSL dependency so the binary
+# loads on any debian-bookworm-glibc-2.36 host regardless of the host
+# image's libssl version.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+http = "1"
+bytes = "1"
+log = "0.4"
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+serde_json = "1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+
+[[bench]]
+name = "mirror_throughput"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,371 @@
+stages:
+  - check
+  - build
+  - smoke
+  - sign
+  - upload
+  - release
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+variables:
+  # renovate: datasource=docker depName=rust
+  RUST_VERSION: "1.94"
+  CARGO_INCREMENTAL: "0"
+  # Debian bookworm ships glibc 2.36. Plugins must be loaded by a process
+  # linked against the same or newer glibc.
+  GLIBC_VERSION: "2.36"
+  LIB_NAME: "libmirror_plugin"
+  HUB_TAG: "latest"
+  # renovate: datasource=crate depName=cargo-auditable
+  # 0.7.0+ required for Rust edition 2024 support (used by this plugin).
+  CARGO_AUDITABLE_VERSION: "0.7.4"
+  # Generic Package Registry path used as the durable home for release
+  # artifacts. Asset links in the GitLab Release point into this URL.
+  PKG_NAME: mirror
+  PKG_REGISTRY_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PKG_NAME}/${CI_COMMIT_TAG}"
+
+.rules-code:
+  rules:
+    - changes:
+        - "**/*.rs"
+        - Cargo.toml
+        - Cargo.lock
+        - rustfmt.toml
+        - "tests/**/*"
+        - .gitlab-ci.yml
+
+# =============================================================================
+# Check Stage
+# =============================================================================
+
+fmt:
+  stage: check
+  image: rust:${RUST_VERSION}-bookworm
+  tags:
+    - saas-linux-small-amd64
+  needs: []
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - !reference [.rules-code, rules]
+  interruptible: true
+  before_script:
+    - rustup component add rustfmt
+  script:
+    - cargo fmt -- --check
+
+clippy:
+  stage: check
+  image: rust:${RUST_VERSION}-bookworm
+  tags:
+    - saas-linux-large-amd64
+  needs: []
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - !reference [.rules-code, rules]
+  interruptible: true
+  script:
+    - rustup component add clippy
+    - cargo clippy --workspace -- -D warnings
+
+test:
+  stage: check
+  image: rust:${RUST_VERSION}-bookworm
+  tags:
+    - saas-linux-large-amd64
+  needs: []
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - !reference [.rules-code, rules]
+  interruptible: true
+  script:
+    - cargo test --workspace
+
+bench:
+  stage: check
+  image: rust:${RUST_VERSION}-bookworm
+  tags:
+    - saas-linux-large-amd64
+  needs: []
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - !reference [.rules-code, rules]
+  interruptible: true
+  script:
+    - cargo bench 2>&1 | tee bench-output.txt
+  artifacts:
+    paths:
+      - bench-output.txt
+      - target/criterion/
+    expire_in: 1 week
+
+# =============================================================================
+# Build Stage — parallel matrix for all supported architectures
+# =============================================================================
+
+build:
+  stage: build
+  image: rust:${RUST_VERSION}-bookworm
+  tags:
+    - saas-linux-large-amd64
+  needs: []
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - !reference [.rules-code, rules]
+  interruptible: true
+  parallel:
+    matrix:
+      - ARCH: amd64
+      - ARCH: arm64
+      - ARCH: armv7
+  variables:
+    # Emit unsigned SLSA v0.2 provenance alongside artifacts (free SLSA-L1).
+    RUNNER_GENERATE_ARTIFACTS_METADATA: "true"
+  before_script:
+    - |
+      case "${ARCH}" in
+        amd64)
+          RUST_TARGET="x86_64-unknown-linux-gnu"
+          CROSS_PKG=""
+          CROSS_LINKER=""
+          ;;
+        arm64)
+          RUST_TARGET="aarch64-unknown-linux-gnu"
+          CROSS_PKG="gcc-aarch64-linux-gnu"
+          CROSS_LINKER="aarch64-linux-gnu-gcc"
+          ;;
+        armv7)
+          RUST_TARGET="armv7-unknown-linux-gnueabihf"
+          CROSS_PKG="gcc-arm-linux-gnueabihf"
+          CROSS_LINKER="arm-linux-gnueabihf-gcc"
+          ;;
+      esac
+    - export RUST_TARGET
+    - rustup target add "${RUST_TARGET}"
+    - |
+      if [ -n "${CROSS_PKG}" ]; then
+        apt-get update -qq && apt-get install -y -qq "${CROSS_PKG}" >/dev/null
+        mkdir -p .cargo
+        cat > .cargo/config.toml <<EOF
+      [target.${RUST_TARGET}]
+      linker = "${CROSS_LINKER}"
+      EOF
+      fi
+    # cargo-auditable embeds a compressed Cargo.lock-equivalent in the binary
+    # so syft + grype can enumerate Rust deps from the published .so files
+    # without source access. Compiled from crates.io for portability.
+    - cargo install --locked "cargo-auditable@${CARGO_AUDITABLE_VERSION}"
+  script:
+    - cargo auditable build --release --target "${RUST_TARGET}"
+    - |
+      mkdir -p artifacts
+      cp "target/${RUST_TARGET}/release/${LIB_NAME}.so" \
+         "artifacts/${LIB_NAME}-${ARCH}-glibc${GLIBC_VERSION}.so"
+      ls -lh "artifacts/${LIB_NAME}-${ARCH}-glibc${GLIBC_VERSION}.so"
+      cd artifacts
+      sha256sum "${LIB_NAME}-${ARCH}-glibc${GLIBC_VERSION}.so" \
+        > "${LIB_NAME}-${ARCH}-glibc${GLIBC_VERSION}.so.sha256"
+  artifacts:
+    paths:
+      - artifacts/
+    expire_in: 1 week
+
+# =============================================================================
+# Smoke Stage — load the .so into the hub image and verify the plugin
+# initialises under each target architecture. arm64/armv7 run under QEMU
+# binfmt on the amd64 runner.
+# =============================================================================
+
+.smoke-base:
+  stage: smoke
+  image: docker:latest
+  tags:
+    - saas-linux-large-amd64
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - !reference [.rules-code, rules]
+  interruptible: true
+  timeout: 10m
+  services:
+    - docker:dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache bash
+    - docker run --rm --privileged tonistiigi/binfmt --install arm64,arm
+    - docker login -u "${CI_REGISTRY_USER}" -p "${CI_REGISTRY_PASSWORD}" "${CI_REGISTRY}"
+
+smoke-amd64:
+  extends: .smoke-base
+  needs:
+    - job: "build: [amd64]"
+      artifacts: true
+  script:
+    - tests/smoke/run.sh --arch amd64
+
+smoke-arm64:
+  extends: .smoke-base
+  needs:
+    - job: "build: [arm64]"
+      artifacts: true
+  script:
+    - tests/smoke/run.sh --arch arm64
+
+smoke-armv7:
+  extends: .smoke-base
+  needs:
+    - job: "build: [armv7]"
+      artifacts: true
+  script:
+    - tests/smoke/run.sh --arch armv7
+
+# =============================================================================
+# Sign Stage — keyless cosign signing of release artifacts. Runs only on
+# version tags. Identity is provided via GitLab OIDC (id_tokens with
+# aud=sigstore); cosign reads SIGSTORE_ID_TOKEN automatically.
+# =============================================================================
+
+# Install cosign from alpine community; trust derives from alpine package signing.
+.install-cosign:
+  before_script:
+    - apk add --no-cache cosign
+    - cosign version
+
+# Sign every file under ./artifacts (per-arch plugin .so files).
+# Output: <file>.cosign.bundle next to each input.
+sign-blobs:
+  stage: sign
+  image: alpine:latest
+  tags:
+    - saas-linux-small-amd64
+  needs:
+    - build
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v.*/
+  variables:
+    COSIGN_YES: "true"
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  before_script:
+    - !reference [.install-cosign, before_script]
+  script:
+    - scripts/sign-release-artifacts.sh
+  artifacts:
+    paths:
+      - artifacts/
+    expire_in: 1 week
+
+# =============================================================================
+# Upload Stage — push release artifacts (.so, .sha256, .cosign.bundle,
+# combined SHA256SUMS) to the GitLab Generic Package Registry. The release-cli
+# step that follows references these stable URLs as asset links.
+# =============================================================================
+
+upload-artifacts:
+  stage: upload
+  image: alpine:latest
+  tags:
+    - saas-linux-small-amd64
+  needs:
+    - sign-blobs
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v.*/
+  before_script:
+    - apk add --no-cache curl bash coreutils
+  script:
+    # Combined SHA256SUMS bundle (one line per artifact, friendly to
+    # `sha256sum -c SHA256SUMS`). Excludes sidecars and any prior bundle.
+    - |
+      cd artifacts
+      : > SHA256SUMS
+      for f in *; do
+        [ -f "$f" ] || continue
+        case "$f" in
+          *.sha256 | *.cosign.bundle | SHA256SUMS) continue ;;
+        esac
+        sha256sum "$f" >> SHA256SUMS
+      done
+      cd ..
+    - scripts/upload-release-artifacts.sh
+
+# =============================================================================
+# Release Stage (triggered by v* tags)
+# =============================================================================
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  tags:
+    - saas-linux-small-amd64
+  needs:
+    - upload-artifacts
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v.*/
+  variables:
+    GIT_DEPTH: 0
+  script:
+    - |
+      VERSION="${CI_COMMIT_TAG#v}"
+      awk -v ver="${VERSION}" '
+        /^## \[/ { if (found) exit; if (index($0, "[" ver "]")) found=1 }
+        found { print }
+      ' CHANGELOG.md > release-notes.md
+      if [ ! -s release-notes.md ]; then
+        echo "Release ${CI_COMMIT_TAG}" > release-notes.md
+      fi
+      cat release-notes.md
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "$CI_COMMIT_TAG"
+    description: ./release-notes.md
+    assets:
+      links:
+        # Combined sha256 manifest for batch verification: `sha256sum -c SHA256SUMS`.
+        - name: "SHA256SUMS"
+          url:  "${PKG_REGISTRY_URL}/SHA256SUMS"
+          link_type: other
+        # ---------- amd64 ----------
+        - name: "${LIB_NAME}-amd64-glibc${GLIBC_VERSION}.so"
+          url:  "${PKG_REGISTRY_URL}/${LIB_NAME}-amd64-glibc${GLIBC_VERSION}.so"
+          link_type: package
+        - name: "${LIB_NAME}-amd64-glibc${GLIBC_VERSION}.so.sha256"
+          url:  "${PKG_REGISTRY_URL}/${LIB_NAME}-amd64-glibc${GLIBC_VERSION}.so.sha256"
+          link_type: other
+        - name: "${LIB_NAME}-amd64-glibc${GLIBC_VERSION}.so.cosign.bundle"
+          url:  "${PKG_REGISTRY_URL}/${LIB_NAME}-amd64-glibc${GLIBC_VERSION}.so.cosign.bundle"
+          link_type: other
+        # ---------- arm64 ----------
+        - name: "${LIB_NAME}-arm64-glibc${GLIBC_VERSION}.so"
+          url:  "${PKG_REGISTRY_URL}/${LIB_NAME}-arm64-glibc${GLIBC_VERSION}.so"
+          link_type: package
+        - name: "${LIB_NAME}-arm64-glibc${GLIBC_VERSION}.so.sha256"
+          url:  "${PKG_REGISTRY_URL}/${LIB_NAME}-arm64-glibc${GLIBC_VERSION}.so.sha256"
+          link_type: other
+        - name: "${LIB_NAME}-arm64-glibc${GLIBC_VERSION}.so.cosign.bundle"
+          url:  "${PKG_REGISTRY_URL}/${LIB_NAME}-arm64-glibc${GLIBC_VERSION}.so.cosign.bundle"
+          link_type: other
+        # ---------- armv7 ----------
+        - name: "${LIB_NAME}-armv7-glibc${GLIBC_VERSION}.so"
+          url:  "${PKG_REGISTRY_URL}/${LIB_NAME}-armv7-glibc${GLIBC_VERSION}.so"
+          link_type: package
+        - name: "${LIB_NAME}-armv7-glibc${GLIBC_VERSION}.so.sha256"
+          url:  "${PKG_REGISTRY_URL}/${LIB_NAME}-armv7-glibc${GLIBC_VERSION}.so.sha256"
+          link_type: other
+        - name: "${LIB_NAME}-armv7-glibc${GLIBC_VERSION}.so.cosign.bundle"
+          url:  "${PKG_REGISTRY_URL}/${LIB_NAME}-armv7-glibc${GLIBC_VERSION}.so.cosign.bundle"
+          link_type: other

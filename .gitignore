@@ -1,0 +1,6 @@
+/target
+/artifacts
+Cargo.lock.bak
+*.so
+!tests/smoke/plugin.so.placeholder
+.DS_Store
