@@ -40,6 +40,11 @@ variables:
         - rustfmt.toml
         - "tests/**/*"
         - .gitlab-ci.yml
+        # Include CHANGELOG.md so release MRs (which typically touch
+        # only the changelog) trigger a verification pipeline rather
+        # than producing an empty pipeline blocked by the
+        # "ci_must_pass" merge gate.
+        - CHANGELOG.md
 
 # =============================================================================
 # Check Stage
