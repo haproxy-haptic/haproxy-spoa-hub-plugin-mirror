@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-14
+
+### Added
+
+- `worker_threads` config option. The plugin's tokio runtime previously
+  hardcoded 2 worker threads; on hosts with real cores to spare this
+  left the dispatch loop under-provisioned for high-fan-out workloads.
+  The new default is auto-derived from
+  `std::thread::available_parallelism()` (cgroup-aware on Linux ≥ 5.16
+  / glibc ≥ 2.36, so CPU-limited Pods see their limit rather than the
+  host's count) with a floor of 2. Operators can pin a specific count
+  via the TOML knob for predictable resource accounting. The floor of
+  2 matters: on a sidecar with `cpu: 100m` (~0.1 CPU),
+  `available_parallelism()` can return 1, which would leave the runtime
+  with a single worker shared between reqwest's connection loop and
+  per-request dispatch tasks — a recipe for self-deadlock under load.
+- `pool_max_idle_per_host` config option (default 32). Bounds the
+  per-target idle-connection pool. reqwest's default is `usize::MAX`,
+  which is fine for a single hot mirror target but explodes for
+  fan-out mirroring across many distinct backends. Setting 0 disables
+  idle reuse entirely — useful for setups where pool reuse would mask
+  staleness in a churning target set.
+
+### Plugin contract update
+
+`[plugins.params]` grows two new optional fields:
+
+```toml
+[plugins.params]
+worker_threads = 4            # optional; auto-derived when omitted
+pool_max_idle_per_host = 32   # default
+```
+
+No breaking changes to the SPOE message contract or the plugin ABI.
+
 ## [0.1.0] - 2026-05-13
 
 ### Added
