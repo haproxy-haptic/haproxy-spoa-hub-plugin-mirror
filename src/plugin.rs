@@ -33,11 +33,20 @@ define_plugin!(MirrorPlugin, {
         let config = PluginConfig::from_context(context);
 
         // Dedicated multi-thread runtime so reqwest's async stack runs
-        // off the SPOA worker. Two worker threads is enough for typical
-        // mirror workloads (the bottleneck is the upstream backend, not
-        // local CPU); scale via `request_concurrency` not threads.
+        // off the SPOA worker. Worker count comes from `worker_threads`
+        // when the operator sets it, otherwise from
+        // `available_parallelism()` floored at 2 (see PluginConfig::
+        // resolved_worker_threads for the rationale). This avoids the
+        // single-worker self-deadlock on tight-CPU-limited sidecars
+        // while scaling up on hosts with real cores to spare.
+        let worker_threads = config.resolved_worker_threads();
+        log::debug!(
+            target: "mirror",
+            "tokio runtime: {worker_threads} worker threads, pool_max_idle_per_host={}",
+            config.pool_max_idle_per_host
+        );
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(worker_threads)
             .thread_name("mirror-plugin")
             .enable_all()
             .build()?;

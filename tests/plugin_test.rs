@@ -52,6 +52,66 @@ fn verify_tls_toggle() {
 }
 
 #[test]
+fn worker_threads_default_is_auto_detect() {
+    let context = make_context(&[]);
+    let config = PluginConfig::from_context(&context);
+    assert!(config.worker_threads.is_none());
+    // resolved_worker_threads must always return ≥ 2 (the floor) — even
+    // on a single-CPU sidecar.
+    assert!(config.resolved_worker_threads() >= 2);
+}
+
+#[test]
+fn worker_threads_override_respected() {
+    let context = make_context(&[("worker_threads", ConfigValue::Integer(8))]);
+    let config = PluginConfig::from_context(&context);
+    assert_eq!(config.worker_threads, Some(8));
+    assert_eq!(config.resolved_worker_threads(), 8);
+}
+
+#[test]
+fn worker_threads_explicit_one_kept() {
+    // Operators may deliberately set worker_threads=1 even though it's
+    // below our default floor — respect the override.
+    let context = make_context(&[("worker_threads", ConfigValue::Integer(1))]);
+    let config = PluginConfig::from_context(&context);
+    assert_eq!(config.resolved_worker_threads(), 1);
+}
+
+#[test]
+fn worker_threads_zero_or_negative_falls_back() {
+    let context = make_context(&[("worker_threads", ConfigValue::Integer(-3))]);
+    let config = PluginConfig::from_context(&context);
+    assert!(config.worker_threads.is_none());
+    // Falls back to the auto-derived floor.
+    assert!(config.resolved_worker_threads() >= 2);
+}
+
+#[test]
+fn pool_max_idle_per_host_default() {
+    let context = make_context(&[]);
+    let config = PluginConfig::from_context(&context);
+    assert_eq!(config.pool_max_idle_per_host, 32);
+}
+
+#[test]
+fn pool_max_idle_per_host_zero_disables_pool() {
+    // 0 is a legal value — disables idle keep-alive entirely. Useful
+    // for setups where pool reuse would mask staleness in a churning
+    // target set.
+    let context = make_context(&[("pool_max_idle_per_host", ConfigValue::Integer(0))]);
+    let config = PluginConfig::from_context(&context);
+    assert_eq!(config.pool_max_idle_per_host, 0);
+}
+
+#[test]
+fn pool_max_idle_per_host_custom() {
+    let context = make_context(&[("pool_max_idle_per_host", ConfigValue::Integer(128))]);
+    let config = PluginConfig::from_context(&context);
+    assert_eq!(config.pool_max_idle_per_host, 128);
+}
+
+#[test]
 fn zero_and_negative_integers_fall_back_to_default() {
     // A zero/negative timeout is nonsense and would block forever or
     // overflow on cast. We fall back to the default rather than panic

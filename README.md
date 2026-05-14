@@ -55,6 +55,10 @@ timeout_ms = 200             # per-request HTTP timeout in milliseconds
 max_body_bytes = 1048576     # cap on body bytes (truncates if exceeded)
 request_concurrency = 1024   # max in-flight mirrors; excess dropped
 verify_tls = false           # validate TLS certs for https targets
+# worker_threads omitted: auto-derived from available_parallelism()
+# floored at 2. Set explicitly for predictable resource accounting:
+# worker_threads = 4
+pool_max_idle_per_host = 32  # per-target idle conn pool cap; 0 disables reuse
 ```
 
 ### Configure HAProxy
@@ -118,12 +122,14 @@ Watch the mirror backend's access log: requests to `primary` should show up ther
 
 ## Configuration Reference
 
-| Parameter            | Type    | Default     | Description                                                                 |
-|----------------------|---------|-------------|-----------------------------------------------------------------------------|
-| `timeout_ms`         | integer | `200`       | Per-request HTTP timeout (connect + send + receive) in milliseconds.        |
-| `max_body_bytes`     | integer | `1048576`   | Hard cap on reassembled body size. Larger bodies are truncated.             |
-| `request_concurrency`| integer | `1024`      | Max in-flight mirrors across all targets. Excess dispatches are dropped.    |
-| `verify_tls`         | boolean | `false`     | Validate TLS certs for `https` targets. Off by default for self-signed.     |
+| Parameter                | Type    | Default                                 | Description                                                                 |
+|--------------------------|---------|-----------------------------------------|-----------------------------------------------------------------------------|
+| `timeout_ms`             | integer | `200`                                   | Per-request HTTP timeout (connect + send + receive) in milliseconds.        |
+| `max_body_bytes`         | integer | `1048576`                               | Hard cap on reassembled body size. Larger bodies are truncated.             |
+| `request_concurrency`    | integer | `1024`                                  | Max in-flight mirrors across all targets. Excess dispatches are dropped.    |
+| `verify_tls`             | boolean | `false`                                 | Validate TLS certs for `https` targets. Off by default for self-signed.     |
+| `worker_threads`         | integer | _auto_ (`available_parallelism()`, ≥ 2) | Tokio worker thread count. Auto-derived per cgroup CPU limit when omitted; floored at 2 to prevent single-worker self-deadlock between reqwest's connection driver and dispatch tasks. |
+| `pool_max_idle_per_host` | integer | `32`                                    | Per-target idle-connection pool cap. `0` disables idle reuse. Raise for high-fan-out workloads with a stable target set; lower for churning target sets where stale connections would mask backend changes. |
 
 ## How It Works
 

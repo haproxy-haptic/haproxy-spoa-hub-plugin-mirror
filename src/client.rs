@@ -31,6 +31,12 @@ impl MirrorClient {
             // Don't reuse the host's `http_proxy` env — mirror traffic
             // is in-cluster pod→pod by design.
             .no_proxy()
+            // Bound the per-host idle pool so a long-running plugin
+            // sweeping many distinct mirror targets doesn't accumulate
+            // unbounded keep-alive sockets. reqwest's default is
+            // usize::MAX, which is fine for a single hot target but
+            // explodes for fan-out mirroring.
+            .pool_max_idle_per_host(config.pool_max_idle_per_host)
             .build()?;
         Ok(MirrorClient {
             inner,
