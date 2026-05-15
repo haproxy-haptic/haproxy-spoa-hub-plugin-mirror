@@ -4,16 +4,40 @@
 //! tokio runtime as a fire-and-forget task. Bounded by a semaphore so
 //! a burst of mirror traffic can't exhaust the connection pool — excess
 //! requests increment the drop counter rather than queueing.
+//!
+//! ## Metrics
+//!
+//! Every dispatch path emits through [`crate::plugin::METRICS`] (a
+//! [`MetricRecorder`] installed by the hub at plugin load). All metric
+//! names appear in Prometheus under the `plugin_mirror_` prefix the hub
+//! adds. Label cardinality scales with the number of distinct mirror
+//! targets — uncapped by chart-side convention, see the haptic
+//! configuration docs.
+//!
+//! | metric                           | kind      | labels                       |
+//! |----------------------------------|-----------|------------------------------|
+//! | `dispatches_total`               | counter   | `target`, `scheme`           |
+//! | `dispatch_dropped_total`         | counter   | `target`, `reason`           |
+//! | `dispatch_outcomes_total`        | counter   | `target`, `outcome`, `status_class` |
+//! | `dispatch_duration_seconds`      | histogram | `target`, `scheme`           |
+//! | `in_flight`                      | gauge     | _(no labels)_                |
+//!
+//! `reason` ∈ `{saturation, invalid_method}`; `outcome` ∈ `{ok, error}`;
+//! `status_class` ∈ `{2xx, 3xx, 4xx, 5xx, none}` (the `none` value is
+//! used when the dispatch errored before getting a response).
+//!
+//! [`MetricRecorder`]: haproxy_spoa_hub_plugin_api::MetricRecorder
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use reqwest::Client;
 use tokio::sync::Semaphore;
 
 use crate::config::PluginConfig;
+use crate::plugin::METRICS;
 use crate::request::MirrorRequest;
 
 #[derive(Clone)]
@@ -21,6 +45,12 @@ pub struct MirrorClient {
     inner: Client,
     permits: Arc<Semaphore>,
     dropped: Arc<AtomicU64>,
+    /// Current in-flight dispatches (after permit acquire, before
+    /// permit drop). Bumped on every successful permit acquire and
+    /// decremented at the end of `dispatch`. Surfaced through the
+    /// `in_flight` gauge each time it changes, so operators can see
+    /// burst pressure without scraping the underlying tokio runtime.
+    in_flight: Arc<AtomicI64>,
 }
 
 impl MirrorClient {
@@ -42,6 +72,7 @@ impl MirrorClient {
             inner,
             permits: Arc::new(Semaphore::new(config.resolved_request_concurrency())),
             dropped: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -55,10 +86,27 @@ impl MirrorClient {
     /// is available (incrementing the drop counter). Otherwise spawns
     /// the HTTP call and returns after the call completes (or errors).
     pub async fn dispatch(&self, req: MirrorRequest) {
+        let target_label: &str = &req.target;
+        let scheme_label: &str = req.scheme.as_str();
+
+        // Every dispatch attempt counts, even ones we'll drop. Lets
+        // operators reason about the saturation rate (dropped / total)
+        // without joining counters across labels.
+        METRICS.counter(
+            "dispatches_total",
+            &[("target", target_label), ("scheme", scheme_label)],
+            1,
+        );
+
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
+                METRICS.counter(
+                    "dispatch_dropped_total",
+                    &[("target", target_label), ("reason", "saturation")],
+                    1,
+                );
                 log::debug!(
                     target: "mirror",
                     "dropping mirror request to {} — concurrency saturated",
@@ -68,12 +116,22 @@ impl MirrorClient {
             }
         };
 
+        // Permit acquired — bump the in-flight gauge.
+        #[allow(clippy::cast_precision_loss)]
+        let in_flight = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        METRICS.gauge("in_flight", &[], in_flight as f64);
+
         let url = build_url(&req);
         let method = match reqwest::Method::from_bytes(req.method.as_bytes()) {
             Ok(m) => m,
             Err(_) => {
                 log::warn!(target: "mirror", "invalid method {:?}", req.method);
-                drop(permit);
+                METRICS.counter(
+                    "dispatch_dropped_total",
+                    &[("target", target_label), ("reason", "invalid_method")],
+                    1,
+                );
+                self.release_permit(permit);
                 return;
             }
         };
@@ -89,19 +147,71 @@ impl MirrorClient {
             builder = builder.body(Bytes::from(req.body));
         }
 
+        // Measure from after-permit-acquire to after-send-complete.
+        // This is the duration of the actual HTTP roundtrip plus any
+        // body-streaming overhead — what an operator tuning
+        // timeout_ms / pool_max_idle_per_host actually cares about.
+        let started = Instant::now();
+        let outcome_label: (&str, &str);
+        let status_class_label: (&str, &str);
         match builder.send().await {
-            Ok(resp) => log::debug!(
-                target: "mirror",
-                "mirror {} → {}: status {}",
-                req.target, url, resp.status()
-            ),
-            Err(err) => log::debug!(
-                target: "mirror",
-                "mirror {} → {} failed: {}",
-                req.target, url, err
-            ),
+            Ok(resp) => {
+                log::debug!(
+                    target: "mirror",
+                    "mirror {} → {}: status {}",
+                    req.target, url, resp.status()
+                );
+                outcome_label = ("outcome", "ok");
+                status_class_label = ("status_class", status_class(resp.status().as_u16()));
+            }
+            Err(err) => {
+                log::debug!(
+                    target: "mirror",
+                    "mirror {} → {} failed: {}",
+                    req.target, url, err
+                );
+                outcome_label = ("outcome", "error");
+                status_class_label = ("status_class", "none");
+            }
         }
+        let elapsed = started.elapsed();
+
+        METRICS.counter(
+            "dispatch_outcomes_total",
+            &[("target", target_label), outcome_label, status_class_label],
+            1,
+        );
+        METRICS.histogram(
+            "dispatch_duration_seconds",
+            &[("target", target_label), ("scheme", scheme_label)],
+            elapsed.as_secs_f64(),
+        );
+
+        self.release_permit(permit);
+    }
+
+    /// Drop a permit and decrement the in-flight gauge. Centralises the
+    /// gauge bookkeeping so the dispatch paths can't forget to mirror
+    /// the increment they did on permit-acquire.
+    fn release_permit(&self, permit: tokio::sync::OwnedSemaphorePermit) {
         drop(permit);
+        #[allow(clippy::cast_precision_loss)]
+        let in_flight = self.in_flight.fetch_sub(1, Ordering::Relaxed) - 1;
+        METRICS.gauge("in_flight", &[], in_flight as f64);
+    }
+}
+
+/// Map an HTTP status code to its standard class string. Bounded
+/// cardinality (5 values) — keeps `dispatch_outcomes_total` labelset
+/// small even with hundreds of distinct targets.
+fn status_class(code: u16) -> &'static str {
+    match code {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
     }
 }
 
@@ -197,5 +307,32 @@ mod tests {
         assert!(is_hop_by_hop("Host"));
         assert!(!is_hop_by_hop("x-foo"));
         assert!(!is_hop_by_hop("user-agent"));
+    }
+
+    /// Pins the `status_class` mapping that lands as a `status_class`
+    /// label on `dispatch_outcomes_total`. Bounded cardinality matters
+    /// here — if this slipped to per-status-code, the label set would
+    /// blow up for a multi-target deployment.
+    #[test]
+    fn status_class_buckets_match_prometheus_convention() {
+        assert_eq!(status_class(100), "1xx");
+        assert_eq!(status_class(199), "1xx");
+        assert_eq!(status_class(200), "2xx");
+        assert_eq!(status_class(204), "2xx");
+        assert_eq!(status_class(299), "2xx");
+        assert_eq!(status_class(301), "3xx");
+        assert_eq!(status_class(399), "3xx");
+        assert_eq!(status_class(404), "4xx");
+        assert_eq!(status_class(418), "4xx");
+        assert_eq!(status_class(499), "4xx");
+        assert_eq!(status_class(500), "5xx");
+        assert_eq!(status_class(599), "5xx");
+        // Out-of-band values (e.g. extension codes) land in `other`
+        // rather than panicking; keeps the dispatcher resilient to
+        // any oddly-coded backend.
+        assert_eq!(status_class(0), "other");
+        assert_eq!(status_class(99), "other");
+        assert_eq!(status_class(600), "other");
+        assert_eq!(status_class(999), "other");
     }
 }

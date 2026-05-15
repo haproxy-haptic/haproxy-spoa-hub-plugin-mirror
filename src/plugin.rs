@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use haproxy_spoa_hub_plugin_api::{ProcessingResult, define_plugin};
+use haproxy_spoa_hub_plugin_api::{MetricRecorder, ProcessingResult, define_plugin};
 use tokio::runtime::Runtime;
 
 use crate::client::MirrorClient;
@@ -17,6 +17,13 @@ struct PluginState {
 }
 
 static STATE: OnceLock<PluginState> = OnceLock::new();
+
+/// Plugin-scoped metric recorder. The `define_plugin!` `metrics_static`
+/// arm below binds the hub's v2 recorder here once between `create`
+/// and `init`. The dispatcher uses this from every code path. With a
+/// v1 hub (pre-vtable-v2) the install never fires and emissions are
+/// silent no-ops, so the plugin remains backward-compatible.
+pub(crate) static METRICS: MetricRecorder = MetricRecorder::new();
 
 #[derive(Debug)]
 struct MirrorPlugin;
@@ -98,4 +105,6 @@ define_plugin!(MirrorPlugin, {
     fn config_schema(&self) -> Option<&str> {
         Some(PluginConfig::config_schema())
     }
+
+    metrics_static = METRICS;
 });
