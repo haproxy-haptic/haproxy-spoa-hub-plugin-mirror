@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-15
+
+### Changed
+
+- `request_concurrency` is now auto-derived by default. Previously the
+  in-flight cap was a static 1024 regardless of how many tokio workers
+  the plugin had — a sidecar with 8 workers got the same headroom as a
+  sidecar with 2, and the workers above 2 sat idle whenever the cap
+  saturated. The new default is `resolved_worker_threads() × 512`,
+  clamped to `[1024, 4096]`. The floor of 1024 matches v0.2.0's
+  hardcoded default exactly, so a tiny-CPU sidecar (1–2 workers) keeps
+  the same permit count; the ceiling of 4096 keeps the in-flight
+  buffer memory bounded on big hosts (beyond ~4k concurrent mirrors
+  per plugin, body buffers + scheduler tail dominate the dispatch
+  benefit — the saturation metric is preferable to unbounded
+  allocations). Operators with workloads that genuinely need more can
+  still pin `request_concurrency` to a specific value in
+  `[plugins.params]`; explicit overrides bypass the clamp.
+
+### Plugin contract update
+
+`request_concurrency` retains its TOML shape (positive integer); only
+the default behavior changed. Schema and SPOE message contract are
+unchanged. No ABI changes.
+
 ## [0.2.0] - 2026-05-14
 
 ### Added

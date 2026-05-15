@@ -53,8 +53,10 @@ By default the plugin mirrors with a 200 ms per-request timeout, 1 MiB body cap,
 [plugins.params]
 timeout_ms = 200             # per-request HTTP timeout in milliseconds
 max_body_bytes = 1048576     # cap on body bytes (truncates if exceeded)
-request_concurrency = 1024   # max in-flight mirrors; excess dropped
 verify_tls = false           # validate TLS certs for https targets
+# request_concurrency omitted: auto-derived as worker_threads × 512,
+# clamped to [1024, 4096]. Set explicitly to bypass the clamp:
+# request_concurrency = 8192
 # worker_threads omitted: auto-derived from available_parallelism()
 # floored at 2. Set explicitly for predictable resource accounting:
 # worker_threads = 4
@@ -126,7 +128,7 @@ Watch the mirror backend's access log: requests to `primary` should show up ther
 |--------------------------|---------|-----------------------------------------|-----------------------------------------------------------------------------|
 | `timeout_ms`             | integer | `200`                                   | Per-request HTTP timeout (connect + send + receive) in milliseconds.        |
 | `max_body_bytes`         | integer | `1048576`                               | Hard cap on reassembled body size. Larger bodies are truncated.             |
-| `request_concurrency`    | integer | `1024`                                  | Max in-flight mirrors across all targets. Excess dispatches are dropped.    |
+| `request_concurrency`    | integer | _auto_ (`worker_threads × 512`, clamped to `[1024, 4096]`) | Max in-flight mirrors across all targets. Excess dispatches are dropped. Auto-scales with the worker count so 8 workers don't share a 2-worker headroom; clamped on both ends because (a) 1024 matches v0.2.0's static default exactly for tiny sidecars and (b) beyond ~4k concurrent mirrors per plugin the body-buffer memory + scheduler tail outweigh accepting more rather than dropping. Explicit overrides bypass the clamp. |
 | `verify_tls`             | boolean | `false`                                 | Validate TLS certs for `https` targets. Off by default for self-signed.     |
 | `worker_threads`         | integer | _auto_ (`available_parallelism()`, ≥ 2) | Tokio worker thread count. Auto-derived per cgroup CPU limit when omitted; floored at 2 to prevent single-worker self-deadlock between reqwest's connection driver and dispatch tasks. |
 | `pool_max_idle_per_host` | integer | `32`                                    | Per-target idle-connection pool cap. `0` disables idle reuse. Raise for high-fan-out workloads with a stable target set; lower for churning target sets where stale connections would mask backend changes. |
@@ -159,7 +161,7 @@ If the concurrency semaphore is saturated, the dispatch returns immediately and 
 
 - **`option http-buffer-request`** is required for PUT/POST body mirroring. Without it, HAProxy doesn't buffer the request body before the SPOE notification, and `arg_body` arrives empty. The trade-off is increased per-request latency under buffering (the entire body is read before the SPOE frame fires).
 - **Body cap (`max_body_bytes`)** truncates rather than skipping. Set lower if you're mirroring high-volume APIs where partial body coverage is acceptable.
-- **Concurrency cap (`request_concurrency`)** prevents the plugin from holding open thousands of in-flight reqwest connections under burst. The default 1024 fits typical clusters; raise for high-fan-out workloads.
+- **Concurrency cap (`request_concurrency`)** prevents the plugin from holding open thousands of in-flight reqwest connections under burst. The auto-derived default scales with the tokio worker count (`worker_threads × 512`, clamped to `[1024, 4096]`); pin explicitly for workloads that need more than 4k concurrent mirrors per plugin instance, accepting the proportional memory cost from buffered request bodies.
 - **Sampling (`rand(100) lt N`)** lives in HAProxy, not the plugin. Keep it there — HAProxy's `rand()` is uniform, well-tested, and avoids per-request plugin overhead for skipped traffic.
 
 ## Development
