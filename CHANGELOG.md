@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-15
+
+### Added
+
+- **Prometheus metrics**. The plugin now emits counters / gauges / histograms through the hub's `/metrics` endpoint (haproxy-spoa-hub v0.6.0+ required for the hub-side dispatcher to install the recorder; the plugin loads against older hubs but emissions are silent no-ops there).
+- New metric set (names appear in Prometheus with the `plugin_mirror_` prefix the hub adds):
+
+  | metric                          | kind      | labels                                |
+  |---------------------------------|-----------|---------------------------------------|
+  | `dispatches_total`              | counter   | `target`, `scheme`                    |
+  | `dispatch_dropped_total`        | counter   | `target`, `reason`                    |
+  | `dispatch_outcomes_total`       | counter   | `target`, `outcome`, `status_class`   |
+  | `dispatch_duration_seconds`     | histogram | `target`, `scheme`                    |
+  | `in_flight`                     | gauge     | _(no labels)_                         |
+
+  `reason` ∈ `{saturation, invalid_method}`; `outcome` ∈ `{ok, error}`; `status_class` ∈ `{1xx, 2xx, 3xx, 4xx, 5xx, other, none}` (the `none` value applies when the dispatch errored before getting a response).
+
+- Operationally this closes the longstanding gap where the only signal a mirror was failing was `kubectl logs` on the backend. The saturation rate (`dispatch_dropped_total{reason="saturation"} / dispatches_total`) is the metric to alert on when sizing `request_concurrency` for a workload; the duration histogram is the right input for tuning `timeout_ms`.
+
+### Changed
+
+- Plugin-API dep bumped from `^0.5` to `^0.6` to pick up the `MetricRecorder` helper and the `metrics_static` macro arm. The vtable change is append-only (see hub v0.6.0 CHANGELOG): v0.3.0 plugin .so files still load on v0.5.x hubs; the v1 hub silently skips the metric-recorder install and the plugin's emissions are no-ops.
+
 ## [0.2.1] - 2026-05-15
 
 ### Changed

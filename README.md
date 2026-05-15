@@ -164,6 +164,28 @@ If the concurrency semaphore is saturated, the dispatch returns immediately and 
 - **Concurrency cap (`request_concurrency`)** prevents the plugin from holding open thousands of in-flight reqwest connections under burst. The auto-derived default scales with the tokio worker count (`worker_threads × 512`, clamped to `[1024, 4096]`); pin explicitly for workloads that need more than 4k concurrent mirrors per plugin instance, accepting the proportional memory cost from buffered request bodies.
 - **Sampling (`rand(100) lt N`)** lives in HAProxy, not the plugin. Keep it there — HAProxy's `rand()` is uniform, well-tested, and avoids per-request plugin overhead for skipped traffic.
 
+## Observability
+
+The plugin emits Prometheus metrics through the hub's `/metrics` endpoint (requires `haproxy-spoa-hub` v0.6.0+ for the v2 vtable's metric recorder; older hubs load the plugin fine but emissions are silent no-ops). All names are prefixed with `plugin_mirror_` by the hub.
+
+| metric                          | kind      | labels                                |
+|---------------------------------|-----------|---------------------------------------|
+| `dispatches_total`              | counter   | `target`, `scheme`                    |
+| `dispatch_dropped_total`        | counter   | `target`, `reason`                    |
+| `dispatch_outcomes_total`       | counter   | `target`, `outcome`, `status_class`   |
+| `dispatch_duration_seconds`     | histogram | `target`, `scheme`                    |
+| `in_flight`                     | gauge     | _(no labels)_                         |
+
+- `reason` ∈ `{saturation, invalid_method}` — `saturation` means `request_concurrency` was hit; `invalid_method` means the SPOE arg carried a method the HTTP layer refused.
+- `outcome` ∈ `{ok, error}` — `ok` means the request reached the mirror backend and returned a response (any status); `error` means the underlying reqwest call failed (timeout, connection refused, TLS handshake, etc.).
+- `status_class` is the response's HTTP status bucketed to its hundreds digit (`2xx`, `4xx`, …), `none` when `outcome=error`. Bounded cardinality keeps the labelset small for fan-out deployments.
+
+Useful alerts and questions to answer from this set:
+
+- `rate(plugin_mirror_dispatch_dropped_total{reason="saturation"}[5m]) > 0` — `request_concurrency` is too low for the workload.
+- `histogram_quantile(0.99, rate(plugin_mirror_dispatch_duration_seconds_bucket[5m])) > 0.2` — tail latency creeping above `timeout_ms`; tune up or split out the slow target.
+- `sum by (target) (rate(plugin_mirror_dispatch_outcomes_total{outcome="error"}[5m])) > 0` — a backend is failing; check from there.
+
 ## Development
 
 ### Commands
