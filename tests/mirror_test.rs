@@ -220,7 +220,7 @@ async fn dropped_when_concurrency_saturated() {
     // never replies; we use a channel from the backend to know
     // deterministically when the permit is held.
     let cfg = PluginConfig {
-        request_concurrency: 1,
+        request_concurrency: Some(1),
         timeout_ms: 60_000,
         ..PluginConfig::default()
     };

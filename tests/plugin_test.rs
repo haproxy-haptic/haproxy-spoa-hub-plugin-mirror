@@ -19,7 +19,7 @@ fn default_config() {
     let config = PluginConfig::from_context(&context);
     assert_eq!(config.timeout_ms, 200);
     assert_eq!(config.max_body_bytes, 1024 * 1024);
-    assert_eq!(config.request_concurrency, 1024);
+    assert!(config.request_concurrency.is_none());
     assert!(!config.verify_tls);
 }
 
@@ -39,9 +39,56 @@ fn custom_body_cap() {
 
 #[test]
 fn custom_concurrency() {
-    let context = make_context(&[("request_concurrency", ConfigValue::Integer(4096))]);
+    let context = make_context(&[("request_concurrency", ConfigValue::Integer(8192))]);
     let config = PluginConfig::from_context(&context);
-    assert_eq!(config.request_concurrency, 4096);
+    // Explicit override bypasses the auto-derive ceiling — operators
+    // tuning for a specific workload shape get the value they ask for.
+    assert_eq!(config.request_concurrency, Some(8192));
+    assert_eq!(config.resolved_request_concurrency(), 8192);
+}
+
+#[test]
+fn request_concurrency_default_is_auto_derived() {
+    let context = make_context(&[]);
+    let config = PluginConfig::from_context(&context);
+    assert!(config.request_concurrency.is_none());
+    // Auto-derive always falls in [1024, 4096] regardless of host CPU
+    // count: floor matches v0.2.0's static default; ceiling keeps the
+    // in-flight buffer-memory budget bounded.
+    let resolved = config.resolved_request_concurrency();
+    assert!(
+        (1024..=4096).contains(&resolved),
+        "resolved {} outside clamp [1024, 4096]",
+        resolved
+    );
+}
+
+#[test]
+fn request_concurrency_scales_with_workers() {
+    // Pinning 4 workers should pull the auto-derived concurrency to 4 *
+    // 512 = 2048 — inside the [1024, 4096] band.
+    let context = make_context(&[("worker_threads", ConfigValue::Integer(4))]);
+    let config = PluginConfig::from_context(&context);
+    assert!(config.request_concurrency.is_none());
+    assert_eq!(config.resolved_request_concurrency(), 2048);
+}
+
+#[test]
+fn request_concurrency_floor_holds_for_tiny_workers() {
+    // worker_threads=1 keeps a 1-CPU sidecar running with the same
+    // 1024-permit headroom v0.2.0 hardcoded.
+    let context = make_context(&[("worker_threads", ConfigValue::Integer(1))]);
+    let config = PluginConfig::from_context(&context);
+    assert_eq!(config.resolved_request_concurrency(), 1024);
+}
+
+#[test]
+fn request_concurrency_ceiling_holds_for_giant_workers() {
+    // 32 workers × 512 = 16384, clamped to the 4096 ceiling. Operators
+    // who genuinely need more must pin the value explicitly.
+    let context = make_context(&[("worker_threads", ConfigValue::Integer(32))]);
+    let config = PluginConfig::from_context(&context);
+    assert_eq!(config.resolved_request_concurrency(), 4096);
 }
 
 #[test]
@@ -125,7 +172,10 @@ fn zero_and_negative_integers_fall_back_to_default() {
     let defaults = PluginConfig::default();
     assert_eq!(config.timeout_ms, defaults.timeout_ms);
     assert_eq!(config.max_body_bytes, defaults.max_body_bytes);
+    // request_concurrency=0 is also nonsense; falls back to None
+    // (auto-derive) rather than producing a zero-permit semaphore.
     assert_eq!(config.request_concurrency, defaults.request_concurrency);
+    assert!(config.request_concurrency.is_none());
 }
 
 #[test]

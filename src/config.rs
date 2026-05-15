@@ -14,7 +14,12 @@ pub struct PluginConfig {
     /// Bounded in-flight mirror requests across all targets. Excess
     /// dispatches are dropped (with a metric increment) rather than
     /// queued — keeps the SPOA worker thread responsive under burst.
-    pub request_concurrency: usize,
+    /// `None` selects an auto-derived default at runtime
+    /// ([`PluginConfig::resolved_request_concurrency`]) that scales
+    /// with `resolved_worker_threads()`; operators can pin a specific
+    /// count via the TOML knob when the worker-count × 512 heuristic
+    /// doesn't match their workload shape.
+    pub request_concurrency: Option<usize>,
     /// Whether to validate TLS certificates when the mirror target uses
     /// `arg_scheme=https`. Defaults to `false` so the conformance suite
     /// (which uses self-signed in-cluster certs) works out of the box.
@@ -40,7 +45,7 @@ impl Default for PluginConfig {
         PluginConfig {
             timeout_ms: 200,
             max_body_bytes: 1024 * 1024,
-            request_concurrency: 1024,
+            request_concurrency: None,
             verify_tls: false,
             worker_threads: None,
             pool_max_idle_per_host: 32,
@@ -69,6 +74,43 @@ impl PluginConfig {
         let detected = available_parallelism().map(NonZeroUsize::get).unwrap_or(2);
         detected.max(2)
     }
+
+    /// Resolve `request_concurrency` to a concrete in-flight cap.
+    /// Returns the operator's explicit override when set; otherwise
+    /// derives `resolved_worker_threads() × 512`, clamped to
+    /// `[1024, 4096]`.
+    ///
+    /// Per-worker math: each tokio worker can comfortably drive ~512
+    /// concurrent reqwest dispatches before scheduling overhead and
+    /// per-task memory dominate. The floor of 1024 matches plugin
+    /// v0.2.0's static default — a small-CPU sidecar (1–2 workers)
+    /// keeps the same headroom it had before auto-sizing. The ceiling
+    /// of 4096 keeps the in-flight set bounded on a 16-thread host:
+    /// beyond ~4k concurrent mirrors per plugin, the memory footprint
+    /// of buffered request bodies and the latency tail of the tokio
+    /// scheduler outweigh the benefit of accepting more rather than
+    /// dropping into the saturation metric. Workloads that genuinely
+    /// need more should pin `request_concurrency` and tune the host's
+    /// memory budget alongside it.
+    ///
+    /// Examples (worker count → resolved concurrency):
+    /// ```text
+    ///   2 →  1024   (floor; tiny sidecar, unchanged from v0.2.0)
+    ///   4 →  2048
+    ///   6 →  3072
+    ///   8 →  4096   (ceiling)
+    ///  16 →  4096   (clamped)
+    /// ```
+    pub fn resolved_request_concurrency(&self) -> usize {
+        const PER_WORKER: usize = 512;
+        const MIN: usize = 1024;
+        const MAX: usize = 4096;
+        if let Some(n) = self.request_concurrency {
+            return n.max(1);
+        }
+        let derived = self.resolved_worker_threads().saturating_mul(PER_WORKER);
+        derived.clamp(MIN, MAX)
+    }
 }
 
 impl PluginConfig {
@@ -93,8 +135,7 @@ impl PluginConfig {
             .get_config("request_concurrency")
             .and_then(|v| v.as_integer())
             .filter(|n| *n > 0)
-            .map(|n| n as usize)
-            .unwrap_or(defaults.request_concurrency);
+            .map(|n| n as usize);
 
         let verify_tls = context
             .get_config("verify_tls")
@@ -130,7 +171,7 @@ impl PluginConfig {
             "properties": {
                 "timeout_ms": { "type": "integer", "minimum": 1, "default": 200 },
                 "max_body_bytes": { "type": "integer", "minimum": 1, "default": 1048576 },
-                "request_concurrency": { "type": "integer", "minimum": 1, "default": 1024 },
+                "request_concurrency": { "type": "integer", "minimum": 1 },
                 "verify_tls": { "type": "boolean", "default": false },
                 "worker_threads": { "type": "integer", "minimum": 1 },
                 "pool_max_idle_per_host": { "type": "integer", "minimum": 0, "default": 32 }

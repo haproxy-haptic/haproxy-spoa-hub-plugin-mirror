@@ -40,7 +40,7 @@ impl MirrorClient {
             .build()?;
         Ok(MirrorClient {
             inner,
-            permits: Arc::new(Semaphore::new(config.request_concurrency)),
+            permits: Arc::new(Semaphore::new(config.resolved_request_concurrency())),
             dropped: Arc::new(AtomicU64::new(0)),
         })
     }
