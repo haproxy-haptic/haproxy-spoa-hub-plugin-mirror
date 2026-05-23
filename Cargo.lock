@@ -479,9 +479,9 @@ dependencies = [
 
 [[package]]
 name = "haproxy-spoa-hub-plugin-api"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c0db5c30285c46d688ff7dc2dce0ee644c0c48de15f51430f9211468cfdfdec"
+checksum = "1cca395af64c1230e48725c164e3c1dbb796868c2c48043eed442c1362a9daf8"
 dependencies = [
  "abi_stable",
 ]
