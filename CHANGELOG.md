@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-24
+
+### Added
+
+- **`drain()` override** for the v3 plugin-API drain phase introduced in `haproxy-spoa-hub` v0.7.0 (`haproxy-spoa-hub#3`). Spin-waits on the internal in-flight dispatch counter reaching zero with the supplied timeout (5ms poll interval). Returns `true` on clean drain, `false` if the timeout elapsed with dispatches still in flight — the hub increments `spoa_hub_config_reload_drain_forced_total{plugin="mirror"}` on the latter and proceeds with `shutdown_all`. Before this release, hub reloads cancelled fire-and-forget `runtime.spawn`'d HTTP dispatches mid-flight (the `runtime.Drop` path), so mirror requests already ACK'd to HAProxy never landed at their destinations. With v0.4.0 on a v0.7.0+ hub the in-flight HTTP exchanges complete before the runtime is torn down.
+- New `MirrorClient::in_flight() -> i64` accessor. Reads the same `Arc<AtomicI64>` counter the `in_flight` gauge already used at metric-emission time; the new accessor is what the `drain()` override spins on. Marked `pub` so test code and the plugin's own drain body can read it without going through the gauge sampler.
+
+### Changed
+
+- Plugin-API dep `^0.6` → `^0.7` to pick up the v3 vtable. Vtable evolution is append-only — this plugin's v0.4.0 `.so` still loads on v0.6.x and v0.5.x hubs (those hubs ignore the appended `drain` field, no behavioural change for them — the cancel-mid-flight bug remains on those hubs, which is their existing behaviour, not a regression introduced here).
+
+### Notes for operators
+
+- On hubs older than v0.7.0: this release behaves identically to v0.3.0 — drain is never called. No reason to upgrade unless you're also upgrading the hub.
+- On hub v0.7.0+: the cancel-mid-flight regression that surfaced as `HTTPRouteRequestMultipleMirrors` gateway-conformance flakes in haproxy-haptic CI is eliminated end-to-end. The default drain budget derives from `max(plugin.timeout_ms) * 1.5` clamped to `[1000ms, 30_000ms]`; override via `[hub] reload_drain_timeout_ms` if mirror dispatches occasionally take longer than that.
+
 ## [0.3.0] - 2026-05-15
 
 ### Added
