@@ -10,11 +10,11 @@ license = "Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Requires plugin-api 0.6.0+ for the v2 vtable that carries
-# set_metric_recorder. Plugin loads on v0.5.x hubs too — the hub
-# silently skips the metric-recorder install on v1 plugins, and the
-# v2 wire format of the vtable is appended after v1 so old hubs
-# read only what they know about.
+# Requires plugin-api 0.7.0+ for the v3 vtable that carries `drain`.
+# Plugin loads on v0.6.x and v0.5.x hubs too — the hub silently
+# skips drain on v1/v2 plugins by reading `read_drain` which returns
+# None for sub-v3 plugins, and the v3 wire format of the vtable is
+# appended after v2 so old hubs read only what they know about.
 haproxy-spoa-hub-plugin-api = "0.7"
 # rustls-tls keeps the .so free of an OpenSSL dependency so the binary
 # loads on any debian-bookworm-glibc-2.36 host regardless of the host
