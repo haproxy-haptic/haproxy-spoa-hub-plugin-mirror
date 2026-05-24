@@ -82,6 +82,15 @@ impl MirrorClient {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    /// Current count of in-flight HTTP dispatches. Each dispatch
+    /// increments this on permit acquisition and decrements when the
+    /// reqwest call returns. Used by the plugin's `drain()` to wait
+    /// for the runtime to quiesce before the hub tears it down on a
+    /// config reload.
+    pub fn in_flight(&self) -> i64 {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
     /// Dispatch one mirror request. Returns immediately when no permit
     /// is available (incrementing the drop counter). Otherwise spawns
     /// the HTTP call and returns after the call completes (or errors).

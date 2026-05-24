@@ -255,3 +255,79 @@ async fn dropped_when_concurrency_saturated() {
 
     busy.abort();
 }
+
+#[tokio::test]
+async fn in_flight_tracks_pending_dispatches() {
+    // Verify the in_flight() accessor returns 0 → 1 → 0 around a
+    // single dispatch. This is what the plugin's drain() spin-waits
+    // on; getting the counter math wrong would silently break drain.
+    let (addr, rx) = start_mock_backend().await;
+    let cfg = PluginConfig::default();
+    let client = MirrorClient::new(&cfg).unwrap();
+
+    assert_eq!(
+        client.in_flight(),
+        0,
+        "fresh client must report no in-flight"
+    );
+
+    let req = MirrorRequest {
+        target: addr.to_string(),
+        scheme: Scheme::Http,
+        method: "GET".to_string(),
+        path: "/in-flight".to_string(),
+        query: None,
+        headers: vec![],
+        body: vec![],
+    };
+
+    // Dispatch returns AFTER the HTTP exchange completes (no spawn
+    // inside dispatch — the spawn happens at the plugin level). So
+    // racing dispatch.await against in_flight observation requires a
+    // tokio::spawn to free this task to observe the counter
+    // mid-dispatch. Same pattern as `dropped_on_saturation` above.
+    let in_flight_view = {
+        let client = client.clone();
+        let req = req.clone();
+        tokio::spawn(async move { client.dispatch(req).await })
+    };
+
+    // Wait until the backend has actually received the request — at
+    // this point the permit is definitively held AND in_flight has
+    // been incremented (the increment happens before the spawn that
+    // sends the HTTP request).
+    let captured = tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("backend received request")
+        .expect("oneshot ok");
+    assert_eq!(captured.path, "/in-flight");
+
+    // Mid-dispatch — counter must show 1.
+    // (Some scheduler jitter possible; allow a tiny retry window.)
+    let mid_count = {
+        let mut observed = 0;
+        for _ in 0..20 {
+            let v = client.in_flight();
+            if v >= 1 {
+                observed = v;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        observed
+    };
+    assert_eq!(mid_count, 1, "in_flight must show the one pending dispatch");
+
+    // Let the dispatch complete; in_flight must return to 0.
+    in_flight_view.await.expect("dispatch task panicked");
+
+    // After dispatch returns, the permit is released and the
+    // counter decremented. The decrement is in the dispatch path's
+    // final release_permit call, so by the time `.await` resolves
+    // here, in_flight is back to 0 — no polling needed.
+    assert_eq!(
+        client.in_flight(),
+        0,
+        "in_flight must return to 0 after dispatch"
+    );
+}

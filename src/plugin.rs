@@ -106,5 +106,50 @@ define_plugin!(MirrorPlugin, {
         Some(PluginConfig::config_schema())
     }
 
+    fn drain(&self, timeout_ms: u64) -> bool {
+        // Hub calls this between the registry swap and shutdown_all
+        // on a config reload. Wait for the fire-and-forget HTTP
+        // dispatches spawned by `process()` to complete before
+        // letting the runtime drop — without this, the spawned
+        // tasks get cancelled by the runtime's Drop and the mirror
+        // requests never land at their destinations. That cancel-
+        // mid-flight pattern is what surfaced as
+        // HTTPRouteRequestMultipleMirrors flakes in haproxy-haptic
+        // CI (haproxy-spoa-hub#3).
+        //
+        // Spin-wait with a 5ms poll interval. 5ms gives a 1000ms
+        // drain budget ~200 polls (plenty of resolution against
+        // mirror dispatches that typically complete in 1-50ms),
+        // and is short enough not to pin a core while waiting.
+        let Some(state) = STATE.get() else {
+            // init() never ran or the static never populated —
+            // nothing to drain.
+            return true;
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if state.client.in_flight() == 0 {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Final read in case a dispatch completed
+                // concurrently with the deadline check.
+                let final_count = state.client.in_flight();
+                if final_count == 0 {
+                    return true;
+                }
+                log::warn!(
+                    target: "mirror",
+                    "drain timeout ({} ms) hit with {} in-flight dispatches still pending; \
+                     the hub will force shutdown and those requests will not land",
+                    timeout_ms, final_count
+                );
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     metrics_static = METRICS;
 });
