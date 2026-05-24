@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 # silently skips the metric-recorder install on v1 plugins, and the
 # v2 wire format of the vtable is appended after v1 so old hubs
 # read only what they know about.
-haproxy-spoa-hub-plugin-api = "0.6"
+haproxy-spoa-hub-plugin-api = "0.7"
 # rustls-tls keeps the .so free of an OpenSSL dependency so the binary
 # loads on any debian-bookworm-glibc-2.36 host regardless of the host
 # image's libssl version.
