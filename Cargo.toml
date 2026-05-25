@@ -16,10 +16,20 @@ crate-type = ["cdylib", "rlib"]
 # None for sub-v3 plugins, and the v3 wire format of the vtable is
 # appended after v2 so old hubs read only what they know about.
 haproxy-spoa-hub-plugin-api = "0.7"
-# rustls-tls keeps the .so free of an OpenSSL dependency so the binary
+# rustls keeps the .so free of an OpenSSL dependency so the binary
 # loads on any debian-bookworm-glibc-2.36 host regardless of the host
 # image's libssl version.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
+#
+# reqwest 0.13's `rustls` feature switched the default crypto provider
+# from `ring` (used by 0.12's `rustls-tls`) to `aws-lc-rs`, which
+# requires `cmake` at build time and a non-trivial cross-compile setup
+# for arm64/armv7 (CC_*/AR_* env vars, cmake toolchain). Selecting
+# `rustls-no-provider` and pulling rustls' `ring` feature in directly
+# keeps the build cmake-free and the cross-compile config unchanged.
+# The matching `CryptoProvider::install_default(ring)` call lives in
+# `MirrorClient::new` (see src/client.rs).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 http = "1"
 bytes = "1"

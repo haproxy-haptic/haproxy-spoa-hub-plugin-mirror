@@ -29,6 +29,7 @@
 //! [`MetricRecorder`]: haproxy_spoa_hub_plugin_api::MetricRecorder
 
 use std::sync::Arc;
+use std::sync::Once;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,20 @@ use tokio::sync::Semaphore;
 use crate::config::PluginConfig;
 use crate::plugin::METRICS;
 use crate::request::MirrorRequest;
+
+/// Install the `ring` `CryptoProvider` as the process-wide rustls default.
+/// reqwest 0.13's `rustls-no-provider` feature ships rustls without a
+/// crypto backend; without an installed default, `Client::builder().build()`
+/// panics on the first HTTPS request. `install_default` returns the
+/// previously-installed provider as Err on subsequent calls, which is
+/// harmless — we just want at-most-once initialisation across plugin
+/// init and any test that constructs a `MirrorClient`.
+fn ensure_rustls_provider() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 #[derive(Clone)]
 pub struct MirrorClient {
@@ -55,6 +70,7 @@ pub struct MirrorClient {
 
 impl MirrorClient {
     pub fn new(config: &PluginConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        ensure_rustls_provider();
         let inner = Client::builder()
             .timeout(Duration::from_millis(config.timeout_ms))
             .danger_accept_invalid_certs(!config.verify_tls)
