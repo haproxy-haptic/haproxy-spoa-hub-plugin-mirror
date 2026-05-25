@@ -19,7 +19,7 @@ haproxy-spoa-hub-plugin-api = "0.7"
 # rustls-tls keeps the .so free of an OpenSSL dependency so the binary
 # loads on any debian-bookworm-glibc-2.36 host regardless of the host
 # image's libssl version.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-tls", "http2", "stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 http = "1"
 bytes = "1"
