@@ -17,10 +17,27 @@ fn make_context(params: &[(&str, ConfigValue)]) -> PluginContext {
 fn default_config() {
     let context = make_context(&[]);
     let config = PluginConfig::from_context(&context);
-    assert_eq!(config.timeout_ms, 200);
+    // Default is intentionally generous (60s). Tight defaults silently
+    // drop mirror dispatches against in-cluster Services that are still
+    // cold-starting (DNS / kube-proxy propagation); per-dispatch
+    // overrides via `arg_timeout_ms` (chart-driven from the primary
+    // backend's `timeout server`) tighten this when needed.
+    assert_eq!(config.timeout_ms, 60_000);
+    assert_eq!(config.retries, 0);
     assert_eq!(config.max_body_bytes, 1024 * 1024);
     assert!(config.request_concurrency.is_none());
     assert!(!config.verify_tls);
+}
+
+#[test]
+fn custom_retries() {
+    // Operators can set a plugin-wide retry budget that applies when
+    // SPOE doesn't pass arg_retries (i.e., when the chart doesn't
+    // emit per-dispatch overrides — e.g., for an operator-emitted
+    // SPOE message that doesn't come from the chart's mirror filter).
+    let context = make_context(&[("retries", ConfigValue::Integer(3))]);
+    let config = PluginConfig::from_context(&context);
+    assert_eq!(config.retries, 3);
 }
 
 #[test]

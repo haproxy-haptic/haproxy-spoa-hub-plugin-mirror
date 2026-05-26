@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-26
+
+### Added
+
+- **Per-dispatch `arg_timeout_ms` and `arg_retries` SPOE args.** The host SPOE message can now carry per-message overrides for the HTTP-roundtrip timeout and the retry budget. When present, they win over the plugin-config defaults; when absent, the plugin falls back to the `[plugins.params]` values (`timeout_ms`, `retries`). The chart side (`charts/haptic`) populates these from the primary backend's `timeout server` / `retries` so a mirror dispatch waits as long as a normal backend request would — a tight uniform default silently dropped mirrors against in-cluster Services that were still cold-starting (DNS / kube-proxy propagation race), and the failure was invisible to operators because dispatch is fire-and-forget. Pinned by `request::tests::timeout_and_retries_present_override_defaults` + `_absent_yield_none` + the per-dispatch boundary tests below.
+- **Retry-on-connection-error.** When `retries > 0`, the dispatcher attempts `retries + 1` times total, waiting 100 ms between attempts. Only retries on errors that `reqwest::Error::is_connect()` or `is_timeout()` returns true for — HTTP-layer 4xx/5xx never enter this path (they come back as `Ok(resp)`). Retry sleep happens inside the background tokio task, so it never adds latency to the user-facing request that triggered the mirror. End-to-end test: `tests::retries_on_connection_error_until_budget_exhausted` (verifies (N+1) attempts and minimum elapsed for 2 retries × 100 ms backoff). Counter test: `tests::arg_retries_zero_makes_single_attempt` (pins that `Some(0)` is distinct from `None` so a misconfigured chart that explicitly disables retries doesn't accidentally inherit a non-zero plugin-config default).
+
+### Changed
+
+- **Default `timeout_ms` raised from 200 ms → 60 000 ms.** The previous 200 ms default reproduced as `HTTPRouteRequestMultipleMirrors` and `HTTPRouteRequestPercentageMirror` conformance flakes in haproxy-haptic CI (the failing mirror dispatch metrics showed all attempts hitting exactly the 200 ms boundary against backend Services created seconds before the test fired). The generous new default gives kube-proxy iptables propagation and CoreDNS record propagation enough headroom to be a non-issue in practice; the chart's per-dispatch `arg_timeout_ms` (derived from the primary backend's `timeout server`) tightens this when an operator actually wants a tight bound for a specific route. Mirror dispatch is fire-and-forget at the SPOE layer (the hub ACKs back to HAProxy long before this timeout fires), so a long failure tail doesn't add latency to user-facing requests — it only delays the in-flight gauge returning to zero on a genuinely unreachable target.
+
+### Notes for operators
+
+- `arg_timeout_ms = 0` is treated as "absent" (fallback to plugin-config default) — protects against a misconfigured chart that emits a literal 0 from creating a "0ms timeout" footgun. `arg_retries = 0` is treated as an explicit "disable retries" override (distinguishable from "not set"). See `request::tests::timeout_zero_is_rejected_at_boundary` + `retries_zero_is_explicit_override`.
+- Existing operators with `timeout_ms` set explicitly in `[plugins.params]` see no change — their override still wins over the new 60 s default. The chart's `params:` block in `values.yaml` currently passes `timeout_ms = 200` explicitly; that chart-side override is removed in the corresponding `haproxy-haptic` change so the new generous default takes effect.
+
 ## [0.4.0] - 2026-05-24
 
 ### Added

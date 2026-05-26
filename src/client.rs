@@ -66,6 +66,16 @@ pub struct MirrorClient {
     /// `in_flight` gauge each time it changes, so operators can see
     /// burst pressure without scraping the underlying tokio runtime.
     in_flight: Arc<AtomicI64>,
+    /// Default per-request timeout used when the SPOE message doesn't
+    /// carry `arg_timeout_ms`. Lifted from
+    /// [`PluginConfig::timeout_ms`](crate::config::PluginConfig::timeout_ms)
+    /// at construction.
+    default_timeout_ms: u64,
+    /// Default retry-budget used when the SPOE message doesn't carry
+    /// `arg_retries`. Lifted from
+    /// [`PluginConfig::retries`](crate::config::PluginConfig::retries)
+    /// at construction.
+    default_retries: u32,
 }
 
 impl MirrorClient {
@@ -89,6 +99,8 @@ impl MirrorClient {
             permits: Arc::new(Semaphore::new(config.resolved_request_concurrency())),
             dropped: Arc::new(AtomicU64::new(0)),
             in_flight: Arc::new(AtomicI64::new(0)),
+            default_timeout_ms: config.timeout_ms,
+            default_retries: config.retries,
         })
     }
 
@@ -161,42 +173,92 @@ impl MirrorClient {
             }
         };
 
-        let mut builder = self.inner.request(method, &url);
-        for (name, value) in &req.headers {
-            if is_hop_by_hop(name) {
-                continue;
-            }
-            builder = builder.header(name, value.clone());
-        }
-        if !req.body.is_empty() {
-            builder = builder.body(Bytes::from(req.body));
-        }
+        // Per-dispatch timeout/retry resolution. The SPOE args win when
+        // present (chart-driven path, derived from the primary
+        // backend's `timeout server` / `retries`), otherwise fall back
+        // to the plugin defaults from `[plugins.params]`.
+        let effective_timeout_ms = req.timeout_ms.unwrap_or(self.default_timeout_ms);
+        let effective_retries = req.retries.unwrap_or(self.default_retries);
+        let max_attempts = effective_retries.saturating_add(1);
 
-        // Measure from after-permit-acquire to after-send-complete.
-        // This is the duration of the actual HTTP roundtrip plus any
-        // body-streaming overhead — what an operator tuning
-        // timeout_ms / pool_max_idle_per_host actually cares about.
+        let body = if req.body.is_empty() {
+            None
+        } else {
+            Some(Bytes::from(req.body))
+        };
+
+        // Build the request fresh on each attempt. reqwest's
+        // `RequestBuilder::try_clone` returns None when the body is a
+        // stream; we use `Bytes` exclusively so a clone-and-retry shape
+        // would also work, but constructing fresh is simpler and lets
+        // the per-request `.timeout()` apply uniformly.
+        let build_request = || -> reqwest::RequestBuilder {
+            let mut b = self
+                .inner
+                .request(method.clone(), &url)
+                .timeout(Duration::from_millis(effective_timeout_ms));
+            for (name, value) in &req.headers {
+                if is_hop_by_hop(name) {
+                    continue;
+                }
+                b = b.header(name, value.clone());
+            }
+            if let Some(bytes) = body.clone() {
+                b = b.body(bytes);
+            }
+            b
+        };
+
+        // Measure from after-permit-acquire to after-the-final-attempt.
+        // Includes any retry backoff so operators see total wall-clock
+        // spent on a single mirror's dispatch path.
         let started = Instant::now();
         let outcome_label: (&str, &str);
         let status_class_label: (&str, &str);
-        match builder.send().await {
-            Ok(resp) => {
-                log::debug!(
-                    target: "mirror",
-                    "mirror {} → {}: status {}",
-                    req.target, url, resp.status()
-                );
-                outcome_label = ("outcome", "ok");
-                status_class_label = ("status_class", status_class(resp.status().as_u16()));
-            }
-            Err(err) => {
-                log::debug!(
-                    target: "mirror",
-                    "mirror {} → {} failed: {}",
-                    req.target, url, err
-                );
-                outcome_label = ("outcome", "error");
-                status_class_label = ("status_class", "none");
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match build_request().send().await {
+                Ok(resp) => {
+                    log::debug!(
+                        target: "mirror",
+                        "mirror {} → {} attempt {}/{}: status {}",
+                        req.target, url, attempt, max_attempts, resp.status()
+                    );
+                    outcome_label = ("outcome", "ok");
+                    status_class_label = ("status_class", status_class(resp.status().as_u16()));
+                    break;
+                }
+                Err(err) => {
+                    // Only retry on errors plausibly caused by transient
+                    // network conditions: connect refused, DNS failure,
+                    // timeout. Don't retry on HTTP-layer errors (4xx/5xx
+                    // never reach here — they come back as Ok(resp)).
+                    let retryable = err.is_connect() || err.is_timeout();
+                    if retryable && attempt < max_attempts {
+                        log::debug!(
+                            target: "mirror",
+                            "mirror {} → {} attempt {}/{} failed (retryable): {}",
+                            req.target, url, attempt, max_attempts, err
+                        );
+                        // Fixed 100ms backoff. Mirror dispatches are
+                        // background — added latency doesn't impact
+                        // user-facing requests. Backoff is short enough
+                        // to catch a sub-second kube-proxy/DNS
+                        // propagation window without ballooning the
+                        // in-flight gauge during a real outage.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    log::debug!(
+                        target: "mirror",
+                        "mirror {} → {} failed after {} attempt(s): {}",
+                        req.target, url, attempt, err
+                    );
+                    outcome_label = ("outcome", "error");
+                    status_class_label = ("status_class", "none");
+                    break;
+                }
             }
         }
         let elapsed = started.elapsed();
@@ -295,6 +357,8 @@ mod tests {
             query: None,
             headers: vec![],
             body: vec![],
+            timeout_ms: None,
+            retries: None,
         }
     }
 

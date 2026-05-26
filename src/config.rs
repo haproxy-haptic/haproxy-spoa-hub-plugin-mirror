@@ -6,8 +6,37 @@ use haproxy_spoa_hub_plugin_api::PluginContext;
 /// Plugin configuration parsed from the hub's `[plugins.params]` TOML table.
 #[derive(Debug, Clone)]
 pub struct PluginConfig {
-    /// Per-request HTTP timeout in milliseconds, end-to-end (connect + send + receive).
+    /// Per-request HTTP timeout in milliseconds, end-to-end (connect +
+    /// send + receive). This is the **fallback** when the SPOE message
+    /// doesn't carry `arg_timeout_ms` — chart-driven dispatches pass
+    /// per-message overrides derived from the primary backend's
+    /// `timeout server`, so each mirror request waits as long as a
+    /// normal backend request would.
+    ///
+    /// The 60s default is generous on purpose: a too-tight default
+    /// silently drops mirror dispatches when an in-cluster Service is
+    /// still cold-starting (DNS not yet propagated, kube-proxy iptables
+    /// not yet installed), and the failure is invisible to the
+    /// operator because dispatch is fire-and-forget. The previous
+    /// 200ms default reproduced as `HTTPRouteRequestMultipleMirrors`
+    /// conformance flakes when the test backend Services were created
+    /// seconds before the test fired (haproxy-spoa-hub#3 follow-up).
+    /// Mirror dispatches are fire-and-forget at the SPOE layer
+    /// (HAProxy gets its ack immediately), so a long failure tail
+    /// doesn't add latency to user-facing requests — it only delays
+    /// the in-flight gauge from returning to zero on a failed mirror.
     pub timeout_ms: u64,
+    /// Retry count on connection-level errors. `0` disables retries
+    /// (default). When `> 0`, dispatch retries up to N times on
+    /// `reqwest::Error::is_connect()` or `is_timeout()` errors with a
+    /// 100ms fixed backoff between attempts. As with `timeout_ms`,
+    /// this is the **fallback** when SPOE doesn't carry `arg_retries`.
+    ///
+    /// Retries are scoped to the background tokio task — they never
+    /// block the SPOE ack to HAProxy. The retry budget includes the
+    /// initial attempt: `retries = 2` means up to 2 attempts total.
+    /// Each attempt observes the same per-attempt `timeout_ms`.
+    pub retries: u32,
     /// Hard cap on the reassembled request body size in bytes. Bodies
     /// exceeding this are truncated; the mirror request is still sent.
     pub max_body_bytes: usize,
@@ -43,7 +72,8 @@ pub struct PluginConfig {
 impl Default for PluginConfig {
     fn default() -> Self {
         PluginConfig {
-            timeout_ms: 200,
+            timeout_ms: 60_000,
+            retries: 0,
             max_body_bytes: 1024 * 1024,
             request_concurrency: None,
             verify_tls: false,
@@ -124,6 +154,13 @@ impl PluginConfig {
             .map(|n| n as u64)
             .unwrap_or(defaults.timeout_ms);
 
+        let retries = context
+            .get_config("retries")
+            .and_then(|v| v.as_integer())
+            .filter(|n| *n >= 0)
+            .map(|n| n as u32)
+            .unwrap_or(defaults.retries);
+
         let max_body_bytes = context
             .get_config("max_body_bytes")
             .and_then(|v| v.as_integer())
@@ -157,6 +194,7 @@ impl PluginConfig {
 
         PluginConfig {
             timeout_ms,
+            retries,
             max_body_bytes,
             request_concurrency,
             verify_tls,
@@ -169,7 +207,8 @@ impl PluginConfig {
         r#"{
             "type": "object",
             "properties": {
-                "timeout_ms": { "type": "integer", "minimum": 1, "default": 200 },
+                "timeout_ms": { "type": "integer", "minimum": 1, "default": 60000 },
+                "retries": { "type": "integer", "minimum": 0, "default": 0 },
                 "max_body_bytes": { "type": "integer", "minimum": 1, "default": 1048576 },
                 "request_concurrency": { "type": "integer", "minimum": 1 },
                 "verify_tls": { "type": "boolean", "default": false },

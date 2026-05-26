@@ -89,6 +89,8 @@ async fn dispatches_get_request() {
             query: None,
             headers: vec![("X-Test".to_string(), b"hello".to_vec())],
             body: vec![],
+            timeout_ms: None,
+            retries: None,
         })
         .await;
 
@@ -122,6 +124,8 @@ async fn dispatches_post_with_body() {
             query: Some("k=v".to_string()),
             headers: vec![("Content-Type".to_string(), b"application/json".to_vec())],
             body: br#"{"hello":"world"}"#.to_vec(),
+            timeout_ms: None,
+            retries: None,
         })
         .await;
 
@@ -159,6 +163,8 @@ async fn hop_by_hop_headers_stripped() {
                 ("X-Keep".to_string(), b"yes".to_vec()),
             ],
             body: vec![],
+            timeout_ms: None,
+            retries: None,
         })
         .await;
 
@@ -235,6 +241,8 @@ async fn dropped_when_concurrency_saturated() {
         query: None,
         headers: vec![],
         body: vec![],
+        timeout_ms: None,
+        retries: None,
     };
 
     let busy = {
@@ -279,6 +287,8 @@ async fn in_flight_tracks_pending_dispatches() {
         query: None,
         headers: vec![],
         body: vec![],
+        timeout_ms: None,
+        retries: None,
     };
 
     // Dispatch returns AFTER the HTTP exchange completes (no spawn
@@ -329,5 +339,96 @@ async fn in_flight_tracks_pending_dispatches() {
         client.in_flight(),
         0,
         "in_flight must return to 0 after dispatch"
+    );
+}
+
+#[tokio::test]
+async fn retries_on_connection_error_until_budget_exhausted() {
+    // Per-dispatch retries=2 against a closed port. Each attempt
+    // fails with `is_connect()` (TCP RST on connection refused), the
+    // dispatcher backs off 100ms and retries. With 2 retries the
+    // total attempt count is 3 (initial + 2 retries) and the
+    // minimum elapsed includes 2 backoff windows = ≥200ms.
+    //
+    // Pins the contract that the chart-side wiring relies on: when
+    // arg_retries=N is passed via SPOE, the plugin makes (N+1)
+    // attempts before giving up. Without this test, a refactor that
+    // accidentally caps attempts at 1 (e.g. an off-by-one in the
+    // `attempt < max_attempts` predicate) would silently lose the
+    // resilience the chart is paying for in latency.
+    let cfg = PluginConfig::default();
+    let client = MirrorClient::new(&cfg).unwrap();
+
+    // Bind a port and immediately close to guarantee "connection
+    // refused" on subsequent connects. Just using a random
+    // unbound port works on Linux but is racy under heavy CI load.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let req = MirrorRequest {
+        target: addr.to_string(),
+        scheme: Scheme::Http,
+        method: "GET".to_string(),
+        path: "/".to_string(),
+        query: None,
+        headers: vec![],
+        body: vec![],
+        timeout_ms: Some(2_000),
+        retries: Some(2),
+    };
+
+    let started = std::time::Instant::now();
+    client.dispatch(req).await;
+    let elapsed = started.elapsed();
+
+    // 2 retries × 100ms backoff = 200ms minimum total. The actual
+    // per-attempt connect-refused returns immediately on Linux, so
+    // the elapsed is dominated by the two backoff sleeps. Use a
+    // loose lower bound (180ms) to absorb scheduler jitter in CI.
+    assert!(
+        elapsed >= Duration::from_millis(180),
+        "retried dispatch must wait at least 2 × 100ms backoff, got {:?}",
+        elapsed
+    );
+}
+
+#[tokio::test]
+async fn arg_retries_zero_makes_single_attempt() {
+    // arg_retries=Some(0) is "no retries" — exactly one attempt.
+    // Distinct from arg_retries=None which falls back to plugin
+    // config default. The dispatch against an unbound port returns
+    // promptly (no backoffs).
+    let cfg = PluginConfig::default();
+    let client = MirrorClient::new(&cfg).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let req = MirrorRequest {
+        target: addr.to_string(),
+        scheme: Scheme::Http,
+        method: "GET".to_string(),
+        path: "/".to_string(),
+        query: None,
+        headers: vec![],
+        body: vec![],
+        timeout_ms: Some(2_000),
+        retries: Some(0),
+    };
+
+    let started = std::time::Instant::now();
+    client.dispatch(req).await;
+    let elapsed = started.elapsed();
+
+    // No backoff windows at all. Pin a tight upper bound to catch a
+    // future refactor that accidentally treats retries=0 as "default
+    // retry count" (which would surface as a noticeable >100ms
+    // elapsed because of at least one backoff).
+    assert!(
+        elapsed < Duration::from_millis(80),
+        "retries=0 must mean exactly one attempt with no backoff, got {:?}",
+        elapsed
     );
 }
