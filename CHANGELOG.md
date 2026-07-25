@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-25
+
+### Changed
+
+- **Single static `mirror` message now fans out to every target.** The SPOE message contract changed from one target per message (`arg_target`/`arg_scheme`/`arg_timeout_ms`/`arg_retries`) to a `;`-delimited `arg_targets` list, each entry `scheme|host:port|timeout_ms|retries`, sharing one set of request-line/body args. `process()` dispatches one fire-and-forget request per parsed entry. This lets the chart use a single, static `spoe-message mirror` + `spoe-group mirror-group`: adding or removing a mirror target only changes the HAProxy frontend (which appends its entry to `txn.gw_mirror_targets`), never `spoe.conf` or the hub TOML — so mirror-target changes no longer trigger a hub config reload. Empty entries and entries without a target are skipped; per-target `timeout_ms`/`retries` keep the same semantics (empty/`0`ms → fall back to plugin defaults, `retries=0` → explicit no-retries). Pinned by `request::tests::targets_list_*`.
+
+### Compatibility
+
+- A message that carries no `arg_targets` falls back to the legacy single-target `arg_target` contract, so an older chart keeps working against this plugin. New chart configs emit only `arg_targets`. Pinned by `request::tests::absent_targets_falls_back_to_single_target_contract`.
+
 ## [0.5.0] - 2026-05-26
 
 ### Added
