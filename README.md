@@ -6,9 +6,9 @@ A [haproxy-spoa-hub](https://gitlab.com/haproxy-haptic/haproxy-spoa-hub) plugin 
 
 ## Overview
 
-Request mirroring sends a copy of an incoming HTTP request to a second backend without affecting the response the original client receives. HAProxy emits an SPOE NOTIFY frame containing the request method, path, headers and body; this plugin reassembles the request and dispatches it asynchronously over HTTP(S) to the target named in the SPOE arg. The plugin acks back to HAProxy immediately — the upstream call lives on a dedicated tokio runtime — so the SPOA worker thread is never blocked.
+Request mirroring sends a copy of an incoming HTTP request to a second backend without affecting the response the original client receives. HAProxy emits an SPOE NOTIFY frame containing the request method, path, headers and body plus a per-request list of mirror targets; this plugin reassembles the request and dispatches it asynchronously over HTTP(S) to every target in the list. The plugin acks back to HAProxy immediately — the upstream calls live on a dedicated tokio runtime — so the SPOA worker thread is never blocked.
 
-Unlike [upstream `haproxytech/spoa-mirror`](https://github.com/haproxytech/spoa-mirror), which pins the mirror destination at agent startup, this plugin accepts the target as a per-request SPOE argument. One plugin instance can therefore serve every HTTPRoute in a cluster — each route picks its own mirror backend by emitting a different `arg_target`. Multi-mirror routes work by emitting multiple `send-spoe-group` calls, each with its own target.
+Unlike [upstream `haproxytech/spoa-mirror`](https://github.com/haproxytech/spoa-mirror), which pins the mirror destination at agent startup, this plugin accepts the targets as a per-request SPOE argument. One plugin instance can therefore serve every HTTPRoute in a cluster from a single static SPOE message + group: the caller appends `scheme|host:port|timeout_ms|retries` entries to one request-scoped variable and passes the joined list as `arg_targets`. A request that mirrors to several destinations at once (a route rule with multiple `RequestMirror` filters, or several `mirror-target` Ingresses on one host) rides one NOTIFY, and the plugin fans out to each entry — so adding a mirror target never changes the SPOE configuration.
 
 ## Quick Start
 
@@ -79,8 +79,7 @@ spoe-agent mirror-agent
     use-backend spoa-hub-backend
 
 spoe-message mirror
-    args arg_target=str(backend-2.example.svc.cluster.local:80) \
-         arg_scheme=str(http) \
+    args arg_targets=var(txn.gw_mirror_targets) \
          arg_method=method \
          arg_path=path \
          arg_query=query \
@@ -90,7 +89,7 @@ spoe-message mirror
     event on-frontend-http-request
 ```
 
-In a Gateway-API controller (like [haptic](https://gitlab.com/haproxy-haptic/haptic)), the `args` line is rendered per HTTPRoute, with `arg_target` bound to the resolved `backendRef` and other args left as plain fetch references.
+`arg_targets` is a `;`-delimited list, each entry `scheme|host:port|timeout_ms|retries` (empty timeout/retries → plugin defaults). In a Gateway-API controller (like [haptic](https://gitlab.com/haproxy-haptic/haptic)), each mirror source appends its own entry to the request-scoped variable — `http-request set-var(txn.gw_mirror_targets) str(<entry>;),concat(,txn.gw_mirror_targets,) if <cond>` — and the `spoe-message` block itself is static.
 
 #### HAProxy frontend (`haproxy.cfg`)
 
@@ -103,8 +102,9 @@ frontend http-in
 
     filter spoe engine mirror config /etc/haproxy/spoe-mirror.conf
 
-    # Fire the mirror; sampled at 20% of traffic via rand().
-    http-request send-spoe-group mirror mirror if { rand(100) lt 20 }
+    # Append a target (sampled at 20% via rand), then fire the group once.
+    http-request set-var(txn.gw_mirror_targets) str(http|backend-2.example.svc.cluster.local:80||;),concat(,txn.gw_mirror_targets,) if { rand(100) lt 20 }
+    http-request send-spoe-group mirror mirror if { var(txn.gw_mirror_targets) -m found }
 
     default_backend primary
 
@@ -150,9 +150,9 @@ Watch the mirror backend's access log: requests to `primary` should show up ther
    └────────────┘                           └──────────────┘
 ```
 
-1. HAProxy emits an SPOE NOTIFY frame with the request method, path, headers (as `req.hdrs_bin`), and body (as `req.body`).
-2. The hub passes the frame to this plugin, which extracts the mirror target from `arg_target`, builds a `reqwest::Request`, and spawns it on the plugin's tokio runtime. The plugin acks the SPOE frame immediately so HAProxy is never waiting on the mirror call.
-3. The mirror request fires asynchronously. The response is discarded.
+1. HAProxy emits an SPOE NOTIFY frame with the request method, path, headers (as `req.hdrs_bin`), body (as `req.body`), and the target list (`arg_targets`).
+2. The hub passes the frame to this plugin, which parses the target list, builds a `reqwest::Request` per target, and spawns each on the plugin's tokio runtime. The plugin acks the SPOE frame immediately so HAProxy is never waiting on the mirror calls.
+3. The mirror requests fire asynchronously. The responses are discarded.
 4. HAProxy continues processing the original request — its response is what reaches the client.
 
 If the concurrency semaphore is saturated, the dispatch returns immediately and the drop counter increments. This bounds memory and connection-pool usage at the cost of skipping some mirror traffic under burst.

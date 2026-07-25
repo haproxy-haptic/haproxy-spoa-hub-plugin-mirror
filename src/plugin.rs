@@ -5,7 +5,7 @@ use tokio::runtime::Runtime;
 
 use crate::client::MirrorClient;
 use crate::config::PluginConfig;
-use crate::request::extract_mirror_request;
+use crate::request::extract_mirror_requests;
 
 /// Shared plugin state, initialised once in `init()` and read from every
 /// `process()` call. `OnceLock` matches the fingerprinting plugin's
@@ -88,7 +88,11 @@ define_plugin!(MirrorPlugin, {
             .get()
             .ok_or("mirror plugin: process() called before init()")?;
 
-        if let Some(req) = extract_mirror_request(message, state.config.max_body_bytes) {
+        // One SPOE message can carry several targets (a route rule with
+        // multiple RequestMirror filters, or several mirror-target
+        // Ingresses sharing a host). Each becomes its own fire-and-forget
+        // dispatch sharing the captured request line/body.
+        for req in extract_mirror_requests(message, state.config.max_body_bytes) {
             let client = state.client.clone();
             // Fire-and-forget: dispatch returns immediately on a saturated
             // semaphore, otherwise sends the HTTP request and discards
