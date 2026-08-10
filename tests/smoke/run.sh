@@ -66,7 +66,9 @@ for i in $(seq 1 30); do
         docker logs smoke-hub
         exit 1
     fi
-    if docker logs smoke-hub 2>&1 | grep -q "listening"; then
+    # Match in-shell: with `| grep -q`, grep exits on first match, the
+    # producer takes SIGPIPE, and pipefail reports 141 -- a match read as a miss.
+    if [[ "$(docker logs smoke-hub 2>&1)" == *listening* ]]; then
         echo "Hub is listening"
         break
     fi
@@ -79,7 +81,7 @@ for i in $(seq 1 30); do
 done
 
 echo "--- Verifying plugin load ---"
-if ! docker logs smoke-hub 2>&1 | grep -q "plugin loaded"; then
+if [[ "$(docker logs smoke-hub 2>&1)" != *"plugin loaded"* ]]; then
     echo "FAIL: 'plugin loaded' not found in logs"
     docker logs smoke-hub
     exit 1
