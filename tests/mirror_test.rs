@@ -393,6 +393,84 @@ async fn retries_on_connection_error_until_budget_exhausted() {
     );
 }
 
+/// Start a backend that records the path of every request it receives
+/// and answers `/redirect-source` with a `302` whose `Location` points
+/// at `/followed`. Loops accepting connections so a redirect-following
+/// client (the bug) would land a second request. Returns the bound
+/// address and the shared list of observed paths.
+async fn start_redirecting_backend() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let paths_srv = paths.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let io = TokioIo::new(stream);
+            let paths_conn = paths_srv.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let paths_req = paths_conn.clone();
+                    async move {
+                        let path = req.uri().path().to_string();
+                        paths_req.lock().unwrap().push(path.clone());
+                        let resp = if path == "/redirect-source" {
+                            Response::builder()
+                                .status(302)
+                                .header("location", "/followed")
+                                .body(Full::new(Bytes::new()))
+                                .unwrap()
+                        } else {
+                            Response::new(Full::new(Bytes::new()))
+                        };
+                        Ok::<_, Infallible>(resp)
+                    }
+                });
+                let _ = http1::Builder::new().serve_connection(io, svc).await;
+            });
+        }
+    });
+
+    (addr, paths)
+}
+
+#[tokio::test]
+async fn does_not_follow_redirects() {
+    // A mirror target that answers with a 302 must not be chased —
+    // following an open redirect would let client-controlled input
+    // steer the mirrored request to an arbitrary host (SSRF). dispatch
+    // returns only after reqwest finishes any redirect chain, so once
+    // it resolves the observed-path list is complete.
+    let (addr, paths) = start_redirecting_backend().await;
+    let cfg = PluginConfig::default();
+    let client = MirrorClient::new(&cfg).unwrap();
+
+    client
+        .dispatch(MirrorRequest {
+            target: addr.to_string(),
+            scheme: Scheme::Http,
+            method: "GET".to_string(),
+            path: "/redirect-source".to_string(),
+            query: None,
+            headers: vec![],
+            body: vec![],
+            timeout_ms: None,
+            retries: None,
+        })
+        .await;
+
+    let observed = paths.lock().unwrap().clone();
+    assert_eq!(
+        observed,
+        vec!["/redirect-source".to_string()],
+        "client must stop at the 302 and never request the Location target"
+    );
+}
+
 #[tokio::test]
 async fn arg_retries_zero_makes_single_attempt() {
     // arg_retries=Some(0) is "no retries" — exactly one attempt.

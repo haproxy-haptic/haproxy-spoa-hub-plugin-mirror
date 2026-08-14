@@ -87,6 +87,11 @@ impl MirrorClient {
             // Don't reuse the host's `http_proxy` env — mirror traffic
             // is in-cluster pod→pod by design.
             .no_proxy()
+            // Never follow a 3xx. Fire-and-forget mirroring discards the
+            // response, so a redirect is pointless — and following one
+            // lets an open-redirect target steer the mirrored request to
+            // an arbitrary host (SSRF). Take the 3xx as the outcome.
+            .redirect(reqwest::redirect::Policy::none())
             // Bound the per-host idle pool so a long-running plugin
             // sweeping many distinct mirror targets doesn't accumulate
             // unbounded keep-alive sockets. reqwest's default is
