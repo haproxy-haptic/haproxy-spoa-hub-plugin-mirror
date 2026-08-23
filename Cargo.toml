@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 # skips drain on v1/v2 plugins by reading `read_drain` which returns
 # None for sub-v3 plugins, and the v3 wire format of the vtable is
 # appended after v2 so old hubs read only what they know about.
-haproxy-spoa-hub-plugin-api = "0.7"
+haproxy-spoa-hub-plugin-api = "0.8"
 # rustls keeps the .so free of an OpenSSL dependency so the binary
 # loads on any debian-bookworm-glibc-2.36 host regardless of the host
 # image's libssl version.
