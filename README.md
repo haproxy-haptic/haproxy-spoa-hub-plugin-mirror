@@ -1,8 +1,8 @@
 # HAProxy SPOA Hub — Mirror Plugin
 
-[![Build Status](https://gitlab.com/haproxy-haptic/haproxy-spoa-hub-plugin-mirror/badges/master/pipeline.svg)](https://gitlab.com/haproxy-haptic/haproxy-spoa-hub-plugin-mirror/-/pipelines)
+[![CI](https://github.com/haproxy-haptic/haproxy-spoa-hub-plugin-mirror/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/haproxy-haptic/haproxy-spoa-hub-plugin-mirror/actions/workflows/ci.yml)
 
-A [haproxy-spoa-hub](https://gitlab.com/haproxy-haptic/haproxy-spoa-hub) plugin that mirrors HTTP requests to a configurable upstream target while the original request continues unaffected. Built for the Gateway API `HTTPRouteFilter` of type `RequestMirror`, but useful anywhere fire-and-forget request duplication is needed (shadow traffic, integration testing against a canary, audit pipelines).
+A [haproxy-spoa-hub](https://github.com/haproxy-haptic/haproxy-spoa-hub) plugin that mirrors HTTP requests to a configurable upstream target while the original request continues unaffected. Built for the Gateway API `HTTPRouteFilter` of type `RequestMirror`, but useful anywhere fire-and-forget request duplication is needed (shadow traffic, integration testing against a canary, audit pipelines).
 
 ## Overview
 
@@ -14,7 +14,7 @@ Unlike [upstream `haproxytech/spoa-mirror`](https://github.com/haproxytech/spoa-
 
 ### Prerequisites
 
-- [haproxy-spoa-hub](https://gitlab.com/haproxy-haptic/haproxy-spoa-hub) v0.5.0 or newer running with this plugin baked in
+- [haproxy-spoa-hub](https://github.com/haproxy-haptic/haproxy-spoa-hub) v0.5.0 or newer running with this plugin baked in
 - HAProxy >= 2.8 (3.1+ for native `mode spop` backend)
 - Rust toolchain (>= 1.86) for building from source
 
@@ -26,7 +26,7 @@ cargo build --release
 
 The output is `target/release/libmirror_plugin.so`. Copy it to the hub's plugin directory.
 
-Pre-built binaries for all supported architectures are available on the [releases page](https://gitlab.com/haproxy-haptic/haproxy-spoa-hub-plugin-mirror/-/releases).
+Pre-built binaries for all supported architectures are available on the [releases page](https://github.com/haproxy-haptic/haproxy-spoa-hub-plugin-mirror/releases).
 
 ### Supported Architectures
 
@@ -89,7 +89,7 @@ spoe-message mirror
     event on-frontend-http-request
 ```
 
-`arg_targets` is a `;`-delimited list, each entry `scheme|host:port|timeout_ms|retries` (empty timeout/retries → plugin defaults). In a Gateway-API controller (like [haptic](https://gitlab.com/haproxy-haptic/haptic)), each mirror source appends its own entry to the request-scoped variable — `http-request set-var(txn.gw_mirror_targets) str(<entry>;),concat(,txn.gw_mirror_targets,) if <cond>` — and the `spoe-message` block itself is static.
+`arg_targets` is a `;`-delimited list, each entry `scheme|host:port|timeout_ms|retries` (empty timeout/retries → plugin defaults). In a Gateway-API controller (like [haptic](https://github.com/haproxy-haptic/haptic)), each mirror source appends its own entry to the request-scoped variable — `http-request set-var(txn.gw_mirror_targets) str(<entry>;),concat(,txn.gw_mirror_targets,) if <cond>` — and the `spoe-message` block itself is static.
 
 #### HAProxy frontend (`haproxy.cfg`)
 

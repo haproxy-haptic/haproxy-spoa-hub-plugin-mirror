@@ -1,5 +1,5 @@
 ARG HUB_TAG=latest
-FROM registry.gitlab.com/haproxy-haptic/haproxy-spoa-hub:${HUB_TAG}
+FROM ghcr.io/haproxy-haptic/haproxy-spoa-hub:${HUB_TAG}
 
 COPY plugin.so /etc/haproxy-spoa-hub/plugins/libmirror_plugin.so
 COPY config.toml /etc/haproxy-spoa-hub/config.toml
