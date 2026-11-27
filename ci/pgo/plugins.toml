@@ -1,0 +1,4 @@
+[[plugins]]
+name = "mirror"
+library = "libmirror_plugin.so"
+messages = ["mirror"]
