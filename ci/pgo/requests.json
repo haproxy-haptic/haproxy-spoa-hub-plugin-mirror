@@ -1,0 +1,12 @@
+[
+  {
+    "message": "mirror",
+    "args": {
+      "arg_target": "$upstream",
+      "arg_path": "/mirror",
+      "arg_method": "GET"
+    },
+    "expect": {},
+    "requires_http": true
+  }
+]
